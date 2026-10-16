@@ -3,6 +3,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import io
 import json
+import tempfile
 from typing import List, Tuple
 
 import numpy as np
@@ -96,6 +97,10 @@ device = st.sidebar.selectbox("디바이스", options=["cpu", "cuda"])
 min_area = st.sidebar.number_input("최소 bbox 면적", value=50)
 thresh_ratio = st.sidebar.slider("Residual threshold ratio", min_value=0.0, max_value=1.0, value=0.7)
 
+# Allow model/threshold upload via UI
+model_upload = st.sidebar.file_uploader("모델 파일 업로드 (.pt/.pth)", type=["pt", "pth"], key="model_upload")
+threshold_upload = st.sidebar.file_uploader("threshold.json 업로드 (선택)", type=["json"], key="thresh_upload")
+
 if 'model_loaded' not in st.session_state:
     st.session_state['model_loaded'] = False
 
@@ -104,7 +109,48 @@ with col1:
     uploaded_files = st.file_uploader("이미지 선택 (여러 개 가능)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
     if st.button("모델 로드/재로딩"):
         try:
-            model, threshold_val, device_t = load_model(model_path, threshold_json, device, latent_dim=256)
+            device_t = torch.device(device)
+            # If a model file uploaded via UI, use it
+            if model_upload is not None:
+                model_bytes = model_upload.read()
+                # Try torch.load from bytes (state_dict or whole model)
+                try:
+                    buffer = io.BytesIO(model_bytes)
+                    state = torch.load(buffer, map_location=device_t)
+                    if isinstance(state, dict):
+                        model = ConvAutoencoder(latent_dim=256).to(device_t)
+                        model.load_state_dict(state)
+                    else:
+                        # saved full model
+                        model = state
+                except Exception:
+                    # Fallback: try torch.jit.load via temp file
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pt")
+                    try:
+                        tmp.write(model_bytes)
+                        tmp.flush()
+                        tmp.close()
+                        model = torch.jit.load(tmp.name, map_location=device_t)
+                    finally:
+                        try:
+                            os.unlink(tmp.name)
+                        except Exception:
+                            pass
+
+                # threshold: uploaded JSON takes precedence if provided
+                if threshold_upload is not None:
+                    thresh_meta = json.load(io.StringIO(threshold_upload.getvalue().decode('utf-8')))
+                    threshold_val = float(thresh_meta.get("threshold", 0.0))
+                else:
+                    try:
+                        with open(threshold_json, "r") as f:
+                            threshold_val = json.load(f)["threshold"]
+                    except Exception:
+                        threshold_val = 0.0
+
+            else:
+                model, threshold_val, device_t = load_model(model_path, threshold_json, device, latent_dim=256)
+
             st.session_state['model'] = model
             st.session_state['threshold'] = threshold_val
             st.session_state['device'] = device_t
@@ -124,7 +170,9 @@ with col1:
         "img_size": img_size,
         "device": device,
         "min_area": min_area,
-        "thresh_ratio": thresh_ratio
+        "thresh_ratio": thresh_ratio,
+        "model_upload": bool(model_upload),
+        "threshold_upload": bool(threshold_upload)
     })
 
 with col2:
